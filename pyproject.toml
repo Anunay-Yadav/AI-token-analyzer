@@ -1,0 +1,17 @@
+[project]
+name = "ai-token-analyzer"
+version = "0.1.0"
+description = "Snapshot and analyze Codex token usage from ccusage."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "rich",
+    "typer",
+]
+
+[project.scripts]
+ai-token-analyzer = "ai_token_analyzer.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

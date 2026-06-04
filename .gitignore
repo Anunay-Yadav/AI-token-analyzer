@@ -1,0 +1,14 @@
+/.venv/
+/raw/*
+/latest/*
+/db/*
+/logs/*
+/locks/*
+!/raw/.gitkeep
+!/latest/.gitkeep
+!/db/.gitkeep
+!/logs/.gitkeep
+!/locks/.gitkeep
+__pycache__/
+*.py[cod]
+*.egg-info/
