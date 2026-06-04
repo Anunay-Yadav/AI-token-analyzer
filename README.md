@@ -78,7 +78,9 @@ uv run ai-token-analyzer analyze timeline --bucket month
 uv run ai-token-analyzer analyze latest
 ```
 
-`analyze timeline` supports `minute`, `hour`, `day`, and `month` buckets. It prints one row per bucket and model, with reasoning tokens, total tokens, cost, input/output tokens, cache tokens, and changed session count.
+All user-facing analysis uses session activity timestamps from the stored data (`last_activity`, then `last_seen`, then `first_seen`) rather than snapshot ingestion time. Snapshot timestamps remain in storage only for audit/history.
+
+`analyze timeline` supports `minute`, `hour`, `day`, and `month` buckets. It prints one row per bucket and model using session activity time, so historical imports group into the correct month instead of the current snapshot month.
 
 Export data:
 

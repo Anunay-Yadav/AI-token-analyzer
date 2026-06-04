@@ -27,6 +27,7 @@ NUMERIC = (
 LATEST_SESSIONS = """
 WITH ranked AS (
   SELECT *,
+         COALESCE(last_activity, last_seen, first_seen, snapshot_ts) AS activity_ts,
          ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY snapshot_ts DESC, snapshot_hash DESC) AS rn,
          COUNT(*) OVER (PARTITION BY session_id) AS updates_count
   FROM session_observations
@@ -91,22 +92,28 @@ def latest_model_rows_allocated(out_dir: Path) -> list[dict[str, Any]]:
     return model_rows
 
 
+def activity_span(session_rows: list[sqlite3.Row]) -> tuple[str | None, str | None]:
+    activity_values = [activity_ts(row) for row in session_rows if activity_ts(row)]
+    if not activity_values:
+        return (None, None)
+    return (min(activity_values), max(activity_values))
+
+
 def summary(out_dir: Path) -> None:
     p = paths(out_dir)
     with connect(out_dir) as conn:
-        snap = conn.execute("SELECT MIN(snapshot_ts), MAX(snapshot_ts), COUNT(*) FROM snapshots").fetchone()
         sessions = latest_session_rows(conn)
         models = latest_model_rows_allocated(out_dir)
+    first_activity, last_activity = activity_span(sessions)
     totals = {key: sum((row[key] or 0) for row in sessions) for key in NUMERIC}
     most_expensive = max(sessions, key=lambda row: row["cost_usd"] or 0, default=None)
     most_active = max(sessions, key=lambda row: row["total_tokens"] or 0, default=None)
-    latest = max(sessions, key=lambda row: row["snapshot_ts"] or "", default=None)
+    latest = max(sessions, key=lambda row: row["activity_ts"] or "", default=None)
     top_model_cost = max(models, key=lambda row: row["cost_usd"] or 0, default=None)
     top_model_tokens = max(models, key=lambda row: row["total_tokens"] or 0, default=None)
     rows = [
-        ("first snapshot time", snap[0] if snap else None),
-        ("last snapshot time", snap[1] if snap else None),
-        ("stored snapshots", snap[2] if snap else 0),
+        ("first activity time", first_activity),
+        ("last activity time", last_activity),
         ("unique sessions", len(sessions)),
         ("total cost estimate", totals["cost_usd"]),
         ("total input tokens", totals["input_tokens"]),
@@ -117,7 +124,7 @@ def summary(out_dir: Path) -> None:
         ("total tokens", totals["total_tokens"]),
         ("most expensive session", most_expensive["session_id"] if most_expensive else None),
         ("most active session by total tokens", most_active["session_id"] if most_active else None),
-        ("latest observed session", latest["session_id"] if latest else None),
+        ("latest active session", latest["session_id"] if latest else None),
         ("top model by cost", top_model_cost["model"] if top_model_cost else None),
         ("top model by tokens", top_model_tokens["model"] if top_model_tokens else None),
         ("database", p["sqlite"]),
@@ -126,8 +133,9 @@ def summary(out_dir: Path) -> None:
 
 
 def sessions(out_dir: Path, top: int, sort: str, repo: str | None, model: str | None) -> None:
-    order = {"cost": "cost_usd", "tokens": "total_tokens", "last_activity": "last_activity", "duration": "first_seen"}.get(sort, "cost_usd")
-    rows = latest_session_rows(connect(out_dir))
+    order = {"cost": "cost_usd", "tokens": "total_tokens", "last_activity": "activity_ts", "duration": "first_seen"}.get(sort, "cost_usd")
+    with connect(out_dir) as conn:
+        rows = latest_session_rows(conn)
     if repo:
         rows = [row for row in rows if repo in str(row["repo"] or row["cwd"] or row["project"] or "")]
     if model:
@@ -141,7 +149,7 @@ def sessions(out_dir: Path, top: int, sort: str, repo: str | None, model: str | 
                 row["session_id"],
                 row["first_seen"],
                 row["last_seen"],
-                row["last_activity"],
+                row["activity_ts"],
                 row["cost_usd"],
                 row["total_tokens"],
                 row["input_tokens"],
@@ -156,7 +164,7 @@ def sessions(out_dir: Path, top: int, sort: str, repo: str | None, model: str | 
         )
     render_table(
         "Sessions",
-        ("session_id", "first_seen", "last_seen", "last_activity", "cost_usd", "total_tokens", "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens", "reasoning_output_tokens", "models", "cwd/project/repo", "updates_count"),
+        ("session_id", "first_seen", "last_seen", "activity_time", "cost_usd", "total_tokens", "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens", "reasoning_output_tokens", "models", "cwd/project/repo", "updates_count"),
         table_rows,
     )
 
@@ -205,6 +213,16 @@ def bucket_ts(ts: str, bucket: str) -> str:
     if bucket == "month":
         return ts[:7]
     return ts[:13]
+
+
+def activity_ts(row: dict[str, Any] | sqlite3.Row) -> str:
+    return (
+        row["last_activity"]
+        or row["last_seen"]
+        or row["first_seen"]
+        or row["snapshot_ts"]
+        or ""
+    )
 
 
 def delta_rows(out_dir: Path) -> list[dict[str, Any]]:
@@ -268,11 +286,14 @@ def model_delta_rows(out_dir: Path) -> list[dict[str, Any]]:
 
 def timeline(out_dir: Path, bucket: str) -> None:
     grouped: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"sessions": set(), **{key: 0 for key in NUMERIC}})
-    source_rows = model_delta_rows(out_dir)
+    with connect(out_dir) as conn:
+        session_rows = {row["session_id"]: dict(row) for row in latest_session_rows(conn)}
+    source_rows = latest_model_rows_allocated(out_dir)
     if not source_rows:
-        source_rows = [{**row, "model": "(session total)"} for row in delta_rows(out_dir)]
+        source_rows = [{**row, "model": "(session total)"} for row in session_rows.values()]
     for row in source_rows:
-        key = (bucket_ts(row["snapshot_ts"], bucket), row["model"])
+        session_row = session_rows.get(row["session_id"], row)
+        key = (bucket_ts(activity_ts(session_row), bucket), row["model"])
         grouped[key]["sessions"].add(row["session_id"])
         for num in NUMERIC:
             grouped[key][num] += row[num] or 0
@@ -299,14 +320,14 @@ def timeline(out_dir: Path, bucket: str) -> None:
         (
             "bucket timestamp",
             "model",
-            "delta reasoning tokens",
-            "delta total tokens",
-            "delta cost",
-            "delta input tokens",
-            "delta output tokens",
-            "delta cache creation tokens",
-            "delta cache read tokens",
-            "changed sessions count",
+            "reasoning tokens",
+            "total tokens",
+            "cost",
+            "input tokens",
+            "output tokens",
+            "cache creation tokens",
+            "cache read tokens",
+            "sessions count",
         ),
         rows,
     )
@@ -314,17 +335,17 @@ def timeline(out_dir: Path, bucket: str) -> None:
 
 def latest(out_dir: Path) -> None:
     p = paths(out_dir)
-    latest_hash = p["latest_hash"].read_text(encoding="utf-8").strip() if p["latest_hash"].exists() else ""
     with connect(out_dir) as conn:
-        row = conn.execute("SELECT snapshot_ts FROM snapshots WHERE snapshot_hash = ?", (latest_hash,)).fetchone()
-        count = conn.execute("SELECT COUNT(*) FROM session_observations WHERE snapshot_hash = ?", (latest_hash,)).fetchone()[0] if latest_hash else 0
+        sessions = latest_session_rows(conn)
+    latest_session = max(sessions, key=lambda row: row["activity_ts"] or "", default=None)
     render_table(
         "Latest",
         ("metric", "value"),
         (
-            ("latest snapshot hash", latest_hash),
-            ("latest snapshot time", row[0] if row else None),
-            ("sessions in latest snapshot", count),
+            ("latest activity time", latest_session["activity_ts"] if latest_session else None),
+            ("latest active session", latest_session["session_id"] if latest_session else None),
+            ("latest session models", models_for_session(out_dir, latest_session["session_id"]) if latest_session else None),
+            ("sessions tracked", len(sessions)),
             ("latest raw JSON path", p["latest_json"]),
             ("SQLite DB path", p["sqlite"]),
             ("collector log path", p["collector_log"]),
